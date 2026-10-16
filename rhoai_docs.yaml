@@ -1,0 +1,17 @@
+# RHOAI Documentation Downloader - Configuration
+# All settings here are overridable per-run via CLI flags.
+
+# Where to store downloaded files and the manifest.json tracking file.
+# Supports ~ expansion. Can be absolute or relative to this config file's location.
+output_dir: ~/rhoai-docs
+
+# Download format for each chapter guide.
+# Options: pdf | html-single | both
+format: pdf
+
+# Versions to show in the interactive menu. Leave empty to show all discovered
+# versions. Only filters the menu — the Local library always lists everything
+# on disk, and --version reaches any version regardless of this list.
+# Quote the values: unquoted 3.10 is parsed as the number 3.1.
+# Example: ["3.5", "3.4"]
+versions: []
