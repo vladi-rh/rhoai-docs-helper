@@ -30,6 +30,7 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -1317,19 +1318,26 @@ def ordered_categories(chapters: list[dict]) -> list[str]:
 
 
 def guide_tree_lines(chapters: list[dict], statuses: dict) -> list[str]:
+    """The category → guide tree as plain lines, for _INDEX.md."""
+    return [line for line, _ in guide_tree_entries(chapters, statuses)]
+
+
+def guide_tree_entries(chapters: list[dict],
+                       statuses: dict) -> list[tuple[str, Optional[str]]]:
     """
     The category → guide tree, shared by _INDEX.md and the TUI's library view
-    so the two can never drift apart.
+    so the two can never drift apart. Each row is paired with the file it
+    describes, or None for a category heading, so the menu can open it.
     """
     cats = ordered_categories(chapters)
     by_cat: dict[str, list[dict]] = {}
     for ch in chapters:
         by_cat.setdefault(ch["category"], []).append(ch)
 
-    lines = []
+    lines: list[tuple[str, Optional[str]]] = []
     for ci, cat in enumerate(cats):
         last_cat = ci == len(cats) - 1
-        lines.append(f"{'└──' if last_cat else '├──'} {cat}")
+        lines.append((f"{'└──' if last_cat else '├──'} {cat}", None))
         guides = by_cat[cat]
         for gi, ch in enumerate(guides):
             stem = "    " if last_cat else "│   "
@@ -1342,8 +1350,9 @@ def guide_tree_lines(chapters: list[dict], statuses: dict) -> list[str]:
             size = fmt_bytes((pdf or {}).get("recorded_size"))
             # Filename last and never truncated: two guides in the same
             # category can share a long prefix and only differ at the end.
-            lines.append(f"{stem}{branch} {icon} {clip(ch['title'], 52):<52}  "
-                         f"{date:>10} {size:>10}  {name}")
+            lines.append((f"{stem}{branch} {icon} {clip(ch['title'], 52):<52}  "
+                          f"{date:>10} {size:>10}  {name}",
+                          name if st else None))
     return lines
 
 
@@ -2145,11 +2154,39 @@ def scan_library(output_dir: Path, manifest: dict) -> list[dict]:
     return sorted(entries, key=key)
 
 
-def library_choices(entries: list[dict], expanded: set,
-                    version_data: dict) -> list:
+def open_in_default_app(path: Path) -> Optional[str]:
     """
-    The tree IS the menu. Version rows expand and collapse on Enter; leaf rows
-    are navigable but do nothing.
+    Hand a file to whatever the desktop opens it with. Returns an error to
+    show the user, or None when the viewer was launched.
+
+    Detached and silenced on purpose: the viewer must outlive this process
+    rather than die with it, and a stray line from xdg-open on stdout would
+    land in the middle of the menu and corrupt the frame.
+    """
+    try:
+        if sys.platform == "darwin":
+            launcher = ["open", str(path)]
+        elif os.name == "nt":
+            os.startfile(path)                       # type: ignore[attr-defined]
+            return None
+        else:
+            launcher = ["xdg-open", str(path)]
+        subprocess.Popen(launcher, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True)
+    except OSError as e:
+        return f"{type(e).__name__}: {e}"
+    return None
+
+
+def library_choices(entries: list[dict], expanded: set,
+                    version_data: dict) -> tuple[list, dict]:
+    """
+    The tree IS the menu. Version rows expand and collapse on Enter; a leaf
+    row opens the file it names, when it names one.
+
+    Returns the choices and a map from leaf value to the path it stands for
+    — a category heading or a guide that was never downloaded maps to
+    nothing, and pressing Enter on it does nothing, as before.
 
     Leaves are real choices rather than Separators on purpose. Separators are
     rendered in questionary's disabled style (uniformly grey, which makes a
@@ -2163,7 +2200,8 @@ def library_choices(entries: list[dict], expanded: set,
     files_w = max(len(f"{e['files']} guides") for e in entries)
     size_w = max(len(fmt_bytes(e["bytes"])) for e in entries)
 
-    choices = []
+    choices: list = []
+    paths: dict[str, Path] = {}
     for i, e in enumerate(entries):
         last = i == len(entries) - 1
         stem = "    " if last else "│   "
@@ -2182,31 +2220,37 @@ def library_choices(entries: list[dict], expanded: set,
         if not open_:
             continue
 
-        leaves = []
+        leaves: list[tuple[str, Optional[Path]]] = []
         data = version_data.get(e["name"])
         if data and not e["snapshot"]:
-            leaves += [f"{stem}{line}"
-                       for line in guide_tree_lines(data["chapters"],
-                                                    data["statuses"])]
+            leaves += [(f"{stem}{line}",
+                        e["path"] / name if name else None)
+                       for line, name in guide_tree_entries(data["chapters"],
+                                                            data["statuses"])]
         else:
             # A frozen snapshot carries no chapter metadata — list its files
-            leaves += [f"{stem}    {fmt_bytes(p.stat().st_size):>10}  {p.name}"
-                       for p in sorted(x for x in e["path"].iterdir()
+            leaves += [(f"{stem}    {fmt_bytes(f.stat().st_size):>10}  {f.name}", f)
+                       for f in sorted(x for x in e["path"].iterdir()
                                        if x.is_file())]
         if e["archived"]:
-            leaves.append(f"{stem}├── archive/   {e['archived']} superseded  "
-                          f"{fmt_bytes(e['archived_bytes'])}")
+            leaves.append((f"{stem}├── archive/   {e['archived']} superseded  "
+                           f"{fmt_bytes(e['archived_bytes'])}",
+                           e["path"] / ARCHIVE_DIRNAME))
         if e["has_index"]:
-            leaves.append(f"{stem}├── {INDEX_FILENAME}")
+            leaves.append((f"{stem}├── {INDEX_FILENAME}",
+                           e["path"] / INDEX_FILENAME))
         if e["has_changelog"]:
-            leaves.append(f"{stem}└── {CHANGELOG_FILENAME}")
+            leaves.append((f"{stem}└── {CHANGELOG_FILENAME}",
+                           e["path"] / CHANGELOG_FILENAME))
 
         # Values are positional and stable for a given expansion state, which
-        # is what lets the cursor be restored after an Enter that did nothing.
-        for line in leaves:
-            choices.append(questionary.Choice(
-                title=line, value=f"{LEAF_PREFIX}{len(choices)}"))
-    return choices
+        # is what lets the cursor be restored after an Enter.
+        for line, path in leaves:
+            value = f"{LEAF_PREFIX}{len(choices)}"
+            if path is not None and path.exists():
+                paths[value] = path
+            choices.append(questionary.Choice(title=line, value=value))
+    return choices, paths
 
 
 def tui_library_screen(output_dir: Path, manifest: dict,
@@ -2233,14 +2277,14 @@ def tui_library_screen(output_dir: Path, manifest: dict,
         if snaps:
             header += "  (snapshots are hardlinked; real usage is lower)"
 
-        choices = library_choices(entries, expanded, version_data)
+        choices, leaf_paths = library_choices(entries, expanded, version_data)
         choices.append(questionary.Separator("  " + "─" * 20))
         choices.append(questionary.Choice(title="  ← Back", value=BACK_CHOICE))
 
         console.print()
         pick = ask_menu(
             header, choices, default=cursor,
-            instruction="(↑↓ navigate, Enter/→ expands, Esc/← back)",
+            instruction="(↑↓ navigate, Enter/→ expands or opens, Esc/← back)",
             back_value=BACK_CHOICE)
         if pick in (None, BACK_CHOICE):
             return
@@ -2248,6 +2292,15 @@ def tui_library_screen(output_dir: Path, manifest: dict,
         cursor = pick                       # keep the cursor where it was
         if not str(pick).startswith(LEAF_PREFIX):
             expanded.symmetric_difference_update({pick})
+        elif pick in leaf_paths:
+            target = leaf_paths[pick]
+            problem = open_in_default_app(target)
+            if problem:
+                console.print(f"[red]Could not open[/red] {target.name} — "
+                              f"{problem}")
+            else:
+                console.print(f"[dim]Opening[/dim] {target.name}[dim] in your "
+                              f"default application…[/dim]")
 
 
 # ---------------------------------------------------------------------------

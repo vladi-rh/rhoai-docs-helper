@@ -617,5 +617,110 @@ class SkippedHeading(unittest.TestCase):
         self.assertEqual(rd.versions_label(None, 6), "  ─── Versions (6) ───")
 
 
+class OpenInDefaultApp(unittest.TestCase):
+    """Enter on a leaf hands the file to the desktop's own viewer."""
+
+    def setUp(self):
+        self.popen = rd.subprocess.Popen
+        self.platform = rd.sys.platform
+        self.launched = []
+        rd.subprocess.Popen = lambda cmd, **kw: self.launched.append((cmd, kw))
+
+    def tearDown(self):
+        rd.subprocess.Popen = self.popen
+        rd.sys.platform = self.platform
+
+    def test_linux_uses_xdg_open(self):
+        rd.sys.platform = "linux"
+        self.assertIsNone(rd.open_in_default_app(pathlib.Path("/tmp/a.pdf")))
+        cmd, kw = self.launched[0]
+        self.assertEqual(cmd, ["xdg-open", "/tmp/a.pdf"])
+
+    def test_macos_uses_open(self):
+        rd.sys.platform = "darwin"
+        rd.open_in_default_app(pathlib.Path("/tmp/a.pdf"))
+        self.assertEqual(self.launched[0][0], ["open", "/tmp/a.pdf"])
+
+    def test_viewer_is_detached_and_silenced(self):
+        rd.sys.platform = "linux"
+        rd.open_in_default_app(pathlib.Path("/tmp/a.pdf"))
+        _cmd, kw = self.launched[0]
+        self.assertTrue(kw["start_new_session"], "viewer would die with us")
+        self.assertEqual(kw["stdout"], rd.subprocess.DEVNULL)
+        self.assertEqual(kw["stderr"], rd.subprocess.DEVNULL,
+                         "stray output would corrupt the menu frame")
+
+    def test_missing_launcher_is_reported_not_raised(self):
+        rd.sys.platform = "linux"
+        def boom(*a, **kw):
+            raise FileNotFoundError(2, "No such file or directory", "xdg-open")
+        rd.subprocess.Popen = boom
+        problem = rd.open_in_default_app(pathlib.Path("/tmp/a.pdf"))
+        self.assertIn("FileNotFoundError", problem)
+
+
+class LibraryLeafPaths(unittest.TestCase):
+    """Which rows of the tree are openable, and what they point at."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.lib = pathlib.Path(self.tmp.name)
+        self.version = self.lib / "3.5"
+        (self.version / rd.ARCHIVE_DIRNAME).mkdir(parents=True)
+        (self.version / "release_notes.pdf").write_bytes(b"%PDF-1.7")
+        (self.version / rd.INDEX_FILENAME).write_text("# index")
+        (self.version / rd.CHANGELOG_FILENAME).write_text("# log")
+        (self.version / rd.ARCHIVE_DIRNAME / "old.pdf").write_bytes(b"%PDF-1.7")
+        self.entries = [{
+            "name": "3.5", "path": self.version, "files": 1, "bytes": 8,
+            "archived": 1, "archived_bytes": 8, "snapshot": False,
+            "z_version": "3.5.1", "has_index": True, "has_changelog": True,
+        }]
+        self.data = {"3.5": {
+            "chapters": [{"slug": "release_notes", "title": "Release Notes",
+                          "category": "About"},
+                         {"slug": "never_fetched", "title": "Not Downloaded",
+                          "category": "About"}],
+            "statuses": {"release_notes": [
+                {"label": "PDF", "filename": "release_notes.pdf",
+                 "status": "ok", "doc_date": "2026-10-15", "recorded_size": 8}]},
+        }}
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def leaves(self):
+        _choices, paths = rd.library_choices(self.entries, {"3.5"}, self.data)
+        return {p.name for p in paths.values()}
+
+    def test_downloaded_guide_is_openable(self):
+        self.assertIn("release_notes.pdf", self.leaves())
+
+    def test_generated_files_and_archive_are_openable(self):
+        self.assertTrue({rd.INDEX_FILENAME, rd.CHANGELOG_FILENAME,
+                         rd.ARCHIVE_DIRNAME} <= self.leaves())
+
+    def test_a_guide_never_downloaded_opens_nothing(self):
+        _choices, paths = rd.library_choices(self.entries, {"3.5"}, self.data)
+        self.assertFalse(any("never_fetched" in str(p) for p in paths.values()))
+
+    def test_category_headings_open_nothing(self):
+        choices, paths = rd.library_choices(self.entries, {"3.5"}, self.data)
+        headings = [c for c in choices
+                    if isinstance(c.title, str) and c.title.endswith("About")]
+        self.assertTrue(headings, "no category heading in the tree")
+        self.assertFalse(any(h.value in paths for h in headings))
+
+    def test_collapsed_version_exposes_no_leaves(self):
+        _choices, paths = rd.library_choices(self.entries, set(), self.data)
+        self.assertEqual(paths, {})
+
+    def test_index_still_renders_the_same_tree(self):
+        lines = rd.guide_tree_lines(self.data["3.5"]["chapters"],
+                                    self.data["3.5"]["statuses"])
+        self.assertTrue(all(isinstance(l, str) for l in lines))
+        self.assertTrue(any("release_notes.pdf" in l for l in lines))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
