@@ -70,8 +70,11 @@ BASE_URL = "https://docs.redhat.com/en/documentation/red_hat_openshift_ai_self-m
 # carry on with, patient on a first run, which has no fallback.
 DISCOVERY_TIMEOUT = 8
 DISCOVERY_TIMEOUT_FIRST_RUN = 30
-SCRIPT_DIR = Path(__file__).parent
-CONFIG_FILE = SCRIPT_DIR / "rhoai_docs.yaml"
+# resolve(), so the shipped yaml is still found when the script is reached
+# through a symlink on PATH — otherwise every setting silently falls back to
+# the DEFAULT_* constants below.
+SCRIPT_DIR = Path(__file__).resolve().parent
+BUNDLED_CONFIG = SCRIPT_DIR / "rhoai_docs.yaml"
 MANIFEST_FILENAME = "manifest.json"
 
 # Used only when rhoai_docs.yaml is missing or omits the key — the shipped
@@ -158,18 +161,39 @@ DETAIL_W = 11
 # Config
 # ---------------------------------------------------------------------------
 
+def config_path() -> Optional[Path]:
+    """
+    Which settings file is in force, most specific first:
+
+        $RHOAI_DOCS_CONFIG  →  ~/.config/rhoai-docs/config.yaml  →  the
+        rhoai_docs.yaml shipped beside the script
+
+    The middle one is what lets a cloned checkout stay clean: settings live
+    outside it, so `git pull` never collides with local choices.
+    """
+    override = os.environ.get("RHOAI_DOCS_CONFIG")
+    xdg = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
+    for candidate in (Path(override).expanduser() if override else None,
+                      xdg / "rhoai-docs" / "config.yaml",
+                      BUNDLED_CONFIG):
+        if candidate and candidate.is_file():
+            return candidate
+    return None
+
+
 def load_config() -> dict:
     """
     Settings resolve in this order, most specific first:
-        CLI flag  →  rhoai_docs.yaml  →  the DEFAULT_* constants above.
-    The constants only apply when the YAML is absent or omits a key.
+        CLI flag  →  the file config_path() picks  →  the DEFAULT_* constants.
+    The constants only apply when no file supplies the key.
     """
     defaults = {"output_dir": DEFAULT_OUTPUT_DIR,
                 "format": DEFAULT_FORMAT,
                 "recheck_after_hours": DEFAULT_RECHECK_HOURS,
                 "versions": []}
-    if CONFIG_FILE.exists():
-        with open(CONFIG_FILE) as f:
+    path = config_path()
+    if path:
+        with open(path) as f:
             user = yaml.safe_load(f) or {}
         defaults.update({k: v for k, v in user.items() if v is not None})
     return defaults

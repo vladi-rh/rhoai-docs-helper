@@ -722,5 +722,75 @@ class LibraryLeafPaths(unittest.TestCase):
         self.assertTrue(any("release_notes.pdf" in l for l in lines))
 
 
+class ConfigResolution(unittest.TestCase):
+    """
+    Where settings come from when the script is installed on PATH. The
+    symlink case matters most: it used to silently fall back to defaults.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = pathlib.Path(self.tmp.name)
+        self.env = {k: os.environ.get(k)
+                    for k in ("RHOAI_DOCS_CONFIG", "XDG_CONFIG_HOME")}
+        for k in self.env:
+            os.environ.pop(k, None)
+        self.bundled = rd.BUNDLED_CONFIG
+
+    def tearDown(self):
+        for k, v in self.env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        rd.BUNDLED_CONFIG = self.bundled
+        self.tmp.cleanup()
+
+    def test_script_dir_follows_a_symlink_to_the_real_file(self):
+        link = self.dir / "rhoai-docs"
+        link.symlink_to(pathlib.Path(rd.__file__).resolve())
+        namespace = {"__file__": str(link), "__name__": "probe"}
+        exec(compile(link.read_text(), str(link), "exec"), namespace)
+        self.assertEqual(namespace["SCRIPT_DIR"],
+                         pathlib.Path(rd.__file__).resolve().parent,
+                         "a symlinked install would lose the bundled config")
+
+    def test_bundled_config_is_the_fallback(self):
+        self.assertEqual(rd.config_path(), rd.BUNDLED_CONFIG)
+
+    def test_user_config_wins_over_the_bundled_one(self):
+        (self.dir / "rhoai-docs").mkdir()
+        user = self.dir / "rhoai-docs" / "config.yaml"
+        user.write_text("output_dir: ~/elsewhere\n")
+        os.environ["XDG_CONFIG_HOME"] = str(self.dir)
+        self.assertEqual(rd.config_path(), user)
+        self.assertEqual(rd.load_config()["output_dir"], "~/elsewhere")
+
+    def test_env_var_wins_over_everything(self):
+        one_off = self.dir / "one-off.yaml"
+        one_off.write_text("output_dir: ~/from-env\n")
+        (self.dir / "rhoai-docs").mkdir()
+        (self.dir / "rhoai-docs" / "config.yaml").write_text("output_dir: ~/xdg\n")
+        os.environ["XDG_CONFIG_HOME"] = str(self.dir)
+        os.environ["RHOAI_DOCS_CONFIG"] = str(one_off)
+        self.assertEqual(rd.load_config()["output_dir"], "~/from-env")
+
+    def test_no_config_anywhere_falls_back_to_the_constants(self):
+        rd.BUNDLED_CONFIG = self.dir / "absent.yaml"
+        os.environ["XDG_CONFIG_HOME"] = str(self.dir / "empty")
+        self.assertIsNone(rd.config_path())
+        config = rd.load_config()
+        self.assertEqual(config["output_dir"], rd.DEFAULT_OUTPUT_DIR)
+        self.assertEqual(config["recheck_after_hours"], rd.DEFAULT_RECHECK_HOURS)
+
+    def test_a_partial_user_config_keeps_the_other_defaults(self):
+        (self.dir / "rhoai-docs").mkdir()
+        (self.dir / "rhoai-docs" / "config.yaml").write_text("format: both\n")
+        os.environ["XDG_CONFIG_HOME"] = str(self.dir)
+        config = rd.load_config()
+        self.assertEqual(config["format"], "both")
+        self.assertEqual(config["output_dir"], rd.DEFAULT_OUTPUT_DIR)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
