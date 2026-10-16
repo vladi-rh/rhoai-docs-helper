@@ -113,6 +113,9 @@ ARCHIVE_DIRNAME = "archive"
 INDEX_FILENAME = "_INDEX.md"
 CHANGELOG_FILENAME = "_CHANGELOG.md"
 
+# One line per run, in the output directory root rather than per version
+RUNLOG_FILENAME = "runs.log"
+
 # The guide whose text names the current z-stream release
 RELEASE_NOTES_SLUG = "release_notes"
 
@@ -221,6 +224,169 @@ class SiteHealth:
 
 
 HEALTH = SiteHealth()
+
+
+class RunLog:
+    """
+    One line per run of the script, newest first, in <output_dir>/runs.log.
+
+    The per-version _CHANGELOG.md already records what moved upstream, in
+    detail, one version at a time. This is the other view: the whole run
+    compressed onto a single line, so "when did I last pull 3.4, and did
+    anything fail?" is answerable by eye — and since the answer is almost
+    always about the last run or two, the newest line goes on top.
+
+        2026-10-16 12:06:02  menu   nothing changed
+        2026-10-16 12:04:11  check  checked 3.5, 3.4, 3.3; upstream 503
+        2026-10-16 11:58:03  menu   downloaded 2.25 (28); release 3.4.3→3.4.4
+
+    Counts, not file names, and no byte totals: the line has to stay
+    scannable at a glance even on a run that touched every version. What
+    exactly moved is in that version's _CHANGELOG.md, and how big the result
+    is, is in _INDEX.md — this says only what happened, to what, and when.
+    Local time, unlike the UTC stamps inside the manifest and change logs:
+    this file is read as "what did I do yesterday", not correlated across
+    machines.
+
+    Facts are recorded where they happen rather than re-derived at the end:
+    once a run is over, nothing on disk distinguishes what this run touched
+    from what was already there. The line is written from quit_now(), the
+    one exit funnel — it leaves via os._exit(), so an atexit hook would
+    never fire — and a run that cannot be logged is never a run that fails.
+    """
+
+    def __init__(self):
+        self.mode = "menu"
+        self.path: Optional[Path] = None
+        self.files: dict = {}          # version -> per-kind file counts
+        self.releases: dict = {}       # version -> (previous z, detected z)
+        self.snapshots: dict = {}      # version -> z-stream frozen this run
+        self.regroups: dict = {}       # version -> number of layout changes
+        self.seen: list[str] = []      # versions looked at, in the order seen
+        self.notes: list[str] = []     # whole-run remarks, e.g. "interrupted"
+        self.written = False
+
+    # -- collection ---------------------------------------------------------
+
+    def begin(self, output_dir: Path, mode: str) -> None:
+        self.path = output_dir / RUNLOG_FILENAME
+        self.mode = mode
+
+    def saw(self, version: str) -> None:
+        if version not in self.seen:
+            self.seen.append(version)
+
+    def _tally(self, version: str) -> dict:
+        self.saw(version)
+        return self.files.setdefault(
+            version, {"new": 0, "updated": 0, "repaired": 0, "failed": 0})
+
+    def saved(self, version: str, status: str) -> None:
+        """One file written. `status` is the pre-download state of that file."""
+        kind = {"changed": "updated", "corrupt": "repaired"}.get(status, "new")
+        self._tally(version)[kind] += 1
+
+    def failed(self, version: str) -> None:
+        self._tally(version)["failed"] += 1
+
+    def release(self, version: str, previous: Optional[str], now: str) -> None:
+        self.releases[version] = (previous, now)
+        self.saw(version)
+
+    def snapshot(self, version: str, z_version: str) -> None:
+        self.snapshots[version] = z_version
+        self.saw(version)
+
+    def regrouped(self, version: str, changes: int) -> None:
+        self.regroups[version] = self.regroups.get(version, 0) + changes
+        self.saw(version)
+
+    def note(self, text: str) -> None:
+        if text not in self.notes:
+            self.notes.append(text)
+
+    # -- rendering ----------------------------------------------------------
+
+    def _releases(self) -> list[str]:
+        # A z-stream seen for the first time is only news for a version whose
+        # files are actually held — otherwise every first run would list a
+        # release for all six versions, which says nothing about this run.
+        return [f"{prev}→{now}" if prev else now
+                for v, (prev, now) in self.releases.items()
+                if prev or v in self.files]
+
+    def changed(self) -> bool:
+        """Did this run actually move anything, as opposed to just looking?"""
+        return bool(self.files or self.snapshots or self.regroups
+                    or self._releases())
+
+    def segments(self) -> list[str]:
+        out = []
+        for kind, word in (("new", "downloaded"), ("updated", "updated"),
+                           ("repaired", "repaired"), ("failed", "failed")):
+            got = [(v, t[kind]) for v, t in self.files.items() if t[kind]]
+            if got:
+                out.append(word + " " + ", ".join(
+                    f"{v} ({n})" for v, n in got))
+
+        rel = self._releases()
+        if rel:
+            out.append("release " + ", ".join(rel))
+        if self.snapshots:
+            out.append("froze " + ", ".join(self.snapshots.values()))
+        if self.regroups:
+            out.append("regrouped " + ", ".join(
+                f"{v} ({n})" for v, n in self.regroups.items()))
+
+        quiet = [v for v in self.seen if v not in self.files
+                 and v not in self.regroups and v not in self.releases]
+        if quiet:
+            out.append("checked " + ", ".join(quiet))
+
+        if HEALTH.degraded:
+            out.append(f"upstream {HEALTH.last_code or 'unreachable'}")
+        out.extend(self.notes)
+        return out
+
+    def body(self) -> str:
+        """Everything but the timestamp — what two runs are compared on."""
+        return (f"{self.mode:<5}  "
+                f"{'; '.join(self.segments()) or 'nothing changed'}")
+
+    def line(self) -> str:
+        return f"{time.strftime('%Y-%m-%d %H:%M:%S')}  {self.body()}"
+
+    def write(self) -> None:
+        # Nothing is created just to hold a log: no output directory means a
+        # run that never got as far as writing anything, and the same rule
+        # append_changelog follows for version directories applies here.
+        if self.written or self.path is None or not self.path.parent.is_dir():
+            return
+        self.written = True
+        try:
+            # Newest first means a rewrite rather than an append, and the
+            # same tmp + os.replace the manifest uses, so an interrupted
+            # write cannot truncate the history. One short line per run
+            # keeps this cheap however long the file gets.
+            kept = (self.path.read_text().splitlines()
+                    if self.path.exists() else [])
+            if not self.changed():
+                # Runs that moved nothing would otherwise repeat the same
+                # sentence forever and bury the runs that did something. The
+                # old copy is dropped and re-added with this run's time, so
+                # the line still answers "when did I last look, and find
+                # nothing?". Lines recording a real change are never merged:
+                # downloading the same guide twice is two events, not one.
+                kept = [k for k in kept if k.partition("  ")[2] != self.body()]
+            text = "\n".join([self.line()] + kept)
+            tmp = self.path.with_name(self.path.name + ".tmp")
+            tmp.write_text(text + "\n")
+            os.replace(tmp, self.path)
+        except OSError:
+            pass            # a log that cannot be written must not end a run
+
+
+RUN = RunLog()
 
 
 def get_html(url: str, timeout: int = 30) -> str:
@@ -932,6 +1098,7 @@ def refresh_zstream(output_dir: Path, version: str, manifest: dict,
 
     previous = meta.get("z_version")
     if previous != detected:
+        RUN.release(version, previous, detected)
         now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         if previous:
             console.print(f"  [yellow]z-stream release: {previous} → "
@@ -995,6 +1162,7 @@ def snapshot_zstream(output_dir: Path, version: str, z_version: str,
     console.print(f"  [green]✓[/green] froze previous release as "
                   f"[bold]{z_version}/[/bold] [dim]({note})[/dim]")
     events.append(f"snapshot: previous release frozen as `{z_version}/` ({note})")
+    RUN.snapshot(version, z_version)
     return target
 
 
@@ -1180,6 +1348,8 @@ def refresh_structure(output_dir: Path, version: str, chapters: list[dict],
 
     if diff and has_changes(diff):
         console.print(f"  [yellow]Page structure changed for v{version}:[/yellow]")
+        RUN.regrouped(version, sum(len(diff[k]) for k in
+                                   ("added", "removed", "moved", "retitled")))
         titles = {ch["slug"]: ch["title"] for ch in chapters}
         for slug in diff["added"]:
             console.print(f"    [green]+[/green] new guide: {titles.get(slug, slug)}")
@@ -1314,6 +1484,8 @@ def run_downloads(to_download: list[tuple[dict, list[dict]]],
                 done += 1
                 downloaded.append(ch["slug"])
 
+                RUN.saved(version, entry["status"])
+
                 was = (prev_meta or {}).get("upstream_size")
                 if entry["status"] == "changed":
                     events.append(f"updated: {ch['title']} "
@@ -1336,6 +1508,7 @@ def run_downloads(to_download: list[tuple[dict, list[dict]]],
                     highlight=False)
             except (requests.RequestException, OSError) as e:
                 failed += 1
+                RUN.failed(version)
                 code = getattr(getattr(e, "response", None), "status_code", None)
                 if isinstance(e, requests.RequestException):
                     HEALTH.record(code)
@@ -2346,6 +2519,9 @@ def main():
     output_dir = Path(os.path.expanduser(args.output or config["output_dir"]))
     version_filter = args.version
 
+    RUN.begin(output_dir, "check" if args.check
+              else "all" if args.download_all else "menu")
+
     console.rule("[bold]RHOAI Documentation Downloader[/bold]")
 
     # Loaded before discovery: it carries the cached version list
@@ -2393,6 +2569,7 @@ def main():
         if catalog.error:
             console.print(f"[red]ERROR:[/red] Could not reach docs.redhat.com: "
                           f"{catalog.error}")
+            RUN.note("upstream unreachable")
             sys.exit(1)
 
     if not version_filter and not interactive:
@@ -2411,6 +2588,7 @@ def main():
             data = version_data.get(v)
             if not data:
                 continue
+            RUN.saw(v)
             if v not in catalog.checked:     # held versions already compared
                 with console.status(f"Checking v{v} against upstream…"):
                     enrich_with_upstream(data["chapters"], data["statuses"],
@@ -2444,6 +2622,7 @@ def main():
             data = version_data.get(v)
             if not data:
                 continue
+            RUN.saw(v)
             chapters, statuses = data["chapters"], data["statuses"]
             # Without this probe --all only ever sees local state, so an
             # upstream change could never be picked up non-interactively.
@@ -2488,6 +2667,7 @@ def main():
             catalog.flush_warnings()
             if catalog.error and not reported_error:
                 reported_error = True
+                RUN.note("upstream unreachable")
                 console.print(f"\n[red]Could not reach docs.redhat.com:[/red] "
                               f"{catalog.error}")
                 console.print("[dim]Your downloaded files are still browsable "
@@ -2536,6 +2716,7 @@ def main():
                           f"{chosen_version}.[/red]")
             continue
 
+        RUN.saw(chosen_version)
         chapters, statuses = data["chapters"], data["statuses"]
 
         # Versions you already hold were checked before the picker; one you
@@ -2629,7 +2810,12 @@ def quit_now(code: int = 0) -> None:
     Safe to skip: every file write in this program is already atomic
     (download via .part + os.replace, manifest and index via .tmp +
     os.replace), so there is nothing buffered that shutdown would flush.
+
+    The run log is written here rather than from an atexit hook for exactly
+    that reason: os._exit() never runs them, and this is the one funnel
+    every exit path goes through.
     """
+    RUN.write()
     sys.stdout.flush()
     sys.stderr.flush()
     os._exit(code)
@@ -2644,6 +2830,7 @@ if __name__ == "__main__":
         # Partial downloads go to .part files that download_binary removes on
         # the way out, and the manifest is written atomically, so there is
         # never anything to repair here.
+        RUN.note("interrupted")
         console.print("\n[dim]Interrupted — nothing left half-written. "
                       "Re-run to pick up where this stopped.[/dim]")
         quit_now(130)
@@ -2651,3 +2838,9 @@ if __name__ == "__main__":
         # sys.exit() anywhere in main() would otherwise stall on the same
         # executor join as a normal return
         quit_now(e.code if isinstance(e.code, int) else 0)
+    except Exception as e:
+        # The traceback is still the useful output here, so it is re-raised
+        # untouched — the log line just records that the run ended this way.
+        RUN.note(f"crashed: {type(e).__name__}")
+        RUN.write()
+        raise
