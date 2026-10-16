@@ -23,6 +23,7 @@ named with the publication date it carried.
 """
 
 import argparse
+import calendar
 import concurrent.futures
 import hashlib
 import json
@@ -62,6 +63,12 @@ MANIFEST_LOCK = threading.Lock()
 # ---------------------------------------------------------------------------
 
 BASE_URL = "https://docs.redhat.com/en/documentation/red_hat_openshift_ai_self-managed"
+
+# The landing page is the site's least reliable URL: 0.4 s on a good day,
+# 27 s or a 503 on a bad one. Short limit once there is a cached list to
+# carry on with, patient on a first run, which has no fallback.
+DISCOVERY_TIMEOUT = 8
+DISCOVERY_TIMEOUT_FIRST_RUN = 30
 SCRIPT_DIR = Path(__file__).parent
 CONFIG_FILE = SCRIPT_DIR / "rhoai_docs.yaml"
 MANIFEST_FILENAME = "manifest.json"
@@ -70,6 +77,11 @@ MANIFEST_FILENAME = "manifest.json"
 # yaml sets both, so changing these alone will not move an existing setup
 DEFAULT_OUTPUT_DIR = "~/rhoai-docs"
 DEFAULT_FORMAT = "pdf"
+# Comparing one version with upstream costs one request per guide — around a
+# hundred for a full library, and minutes when the site is slow. A version
+# compared this recently is left alone by the menu's background pass; opening
+# it still re-checks before anything is downloaded. 0 disables the skip.
+DEFAULT_RECHECK_HOURS = 1
 
 CATEGORY_ORDER = [
     "What's New", "Early Access", "Install", "Get started", "Plan",
@@ -153,6 +165,7 @@ def load_config() -> dict:
     """
     defaults = {"output_dir": DEFAULT_OUTPUT_DIR,
                 "format": DEFAULT_FORMAT,
+                "recheck_after_hours": DEFAULT_RECHECK_HOURS,
                 "versions": []}
     if CONFIG_FILE.exists():
         with open(CONFIG_FILE) as f:
@@ -182,22 +195,40 @@ class SiteHealth:
     def __init__(self):
         self.server_errors = 0
         self.last_code: Optional[int] = None
+        self._lock = threading.Lock()
 
     def record(self, code: Optional[int]) -> None:
-        """Count 5xx and connection failures; anything else resets the streak."""
-        if code is None or code >= 500:
-            self.server_errors += 1
-            self.last_code = code
-        else:
-            self.server_errors = 0
+        """
+        Count 5xx and connection failures; anything else resets the streak.
+
+        Locked because up to 20 probe threads report at once — safe under
+        the GIL, not under a free-threaded build.
+        """
+        with self._lock:
+            if code is None or code >= 500:
+                self.server_errors += 1
+                self.last_code = code
+            else:
+                self.server_errors = 0
 
     @property
     def degraded(self) -> bool:
         return self.server_errors >= self.ABORT_AFTER
 
+    @property
+    def suspected(self) -> bool:
+        """
+        At least one server-side failure, which may be all there is: a run
+        can die on its first request, never reaching the three that mean
+        degraded.
+        """
+        return self.server_errors > 0
+
     def describe(self) -> str:
-        what = f"HTTP {self.last_code}" if self.last_code else "connection failures"
-        return (f"docs.redhat.com is returning {what} repeatedly. This is a "
+        what = (f"returning HTTP {self.last_code}" if self.last_code
+                else "not answering")
+        often = " repeatedly" if self.degraded else ""
+        return (f"docs.redhat.com is {what}{often}. This is a "
                 f"site-side outage, not a problem with your request or your "
                 f"local files — nothing has been corrupted. Wait a few minutes "
                 f"and run again; anything already downloaded will be skipped.")
@@ -230,29 +261,19 @@ class RunLog:
     """
     One line per run of the script, newest first, in <output_dir>/runs.log.
 
-    The per-version _CHANGELOG.md already records what moved upstream, in
-    detail, one version at a time. This is the other view: the whole run
-    compressed onto a single line, so "when did I last pull 3.4, and did
-    anything fail?" is answerable by eye — and since the answer is almost
-    always about the last run or two, the newest line goes on top.
+    Where _CHANGELOG.md details what moved in one version, this is the whole
+    run on one line, so "when did I last pull 3.4, and did anything fail?"
+    is answerable by eye:
 
         2026-10-16 12:06:02  menu   nothing changed
         2026-10-16 12:04:11  check  checked 3.5, 3.4, 3.3; upstream 503
         2026-10-16 11:58:03  menu   downloaded 2.25 (28); release 3.4.3→3.4.4
 
-    Counts, not file names, and no byte totals: the line has to stay
-    scannable at a glance even on a run that touched every version. What
-    exactly moved is in that version's _CHANGELOG.md, and how big the result
-    is, is in _INDEX.md — this says only what happened, to what, and when.
-    Local time, unlike the UTC stamps inside the manifest and change logs:
-    this file is read as "what did I do yesterday", not correlated across
-    machines.
-
-    Facts are recorded where they happen rather than re-derived at the end:
-    once a run is over, nothing on disk distinguishes what this run touched
-    from what was already there. The line is written from quit_now(), the
-    one exit funnel — it leaves via os._exit(), so an atexit hook would
-    never fire — and a run that cannot be logged is never a run that fails.
+    Counts only, in local time — what exactly moved is in _CHANGELOG.md,
+    how big it is in _INDEX.md. Facts are recorded where they happen, since
+    afterwards nothing on disk says which run touched what, and the line is
+    written from quit_now(): that leaves via os._exit(), so an atexit hook
+    would never fire. A run that cannot be logged still succeeds.
     """
 
     def __init__(self):
@@ -364,19 +385,15 @@ class RunLog:
             return
         self.written = True
         try:
-            # Newest first means a rewrite rather than an append, and the
-            # same tmp + os.replace the manifest uses, so an interrupted
-            # write cannot truncate the history. One short line per run
-            # keeps this cheap however long the file gets.
+            # Newest first means a rewrite, not an append — via tmp +
+            # os.replace, so an interrupted write cannot truncate history.
             kept = (self.path.read_text().splitlines()
                     if self.path.exists() else [])
             if not self.changed():
-                # Runs that moved nothing would otherwise repeat the same
-                # sentence forever and bury the runs that did something. The
-                # old copy is dropped and re-added with this run's time, so
-                # the line still answers "when did I last look, and find
-                # nothing?". Lines recording a real change are never merged:
-                # downloading the same guide twice is two events, not one.
+                # A run that moved nothing replaces its own previous line
+                # instead of repeating it, so "when did I last look and find
+                # nothing?" stays answerable without burying the runs that
+                # did something. Real changes are never merged.
                 kept = [k for k in kept if k.partition("  ")[2] != self.body()]
             text = "\n".join([self.line()] + kept)
             tmp = self.path.with_name(self.path.name + ".tmp")
@@ -398,13 +415,6 @@ def get_html(url: str, timeout: int = 30) -> str:
     HEALTH.record(resp.status_code)
     resp.raise_for_status()
     return resp.text
-
-
-def get_final_url(url: str, timeout: int = 30) -> str:
-    """HEAD, not GET — we only want the redirect target, not 370 KB of page."""
-    resp = SESSION.head(url, timeout=timeout, allow_redirects=True)
-    resp.raise_for_status()
-    return resp.url
 
 
 def extract_pdf_date(header: str) -> Optional[str]:
@@ -489,6 +499,44 @@ def fmt_secs(seconds: float) -> str:
     if seconds < 60:
         return f"{seconds:.1f}s"
     return f"{int(seconds) // 60}m{int(seconds) % 60:02d}s"
+
+
+def fmt_age(seconds: float) -> str:
+    """Rounded down, coarsest unit that fits: 45m, 3h, 2d."""
+    if seconds < 3600:
+        return f"{int(seconds // 60)}m"
+    if seconds < 86400:
+        return f"{int(seconds // 3600)}h"
+    return f"{int(seconds // 86400)}d"
+
+
+def seconds_since(stamp: Optional[str]) -> Optional[float]:
+    """Age of one of the manifest's UTC timestamps, or None if unreadable."""
+    if not stamp:
+        return None
+    try:
+        return max(0.0, time.time() - calendar.timegm(
+            time.strptime(stamp, "%Y-%m-%dT%H:%M:%SZ")))
+    except (ValueError, TypeError):
+        return None
+
+
+def last_compared(manifest: dict, version: str,
+                  chapters: list[dict]) -> Optional[float]:
+    """
+    Seconds since this version was last compared with upstream, measured
+    from its *oldest* tracked file: one guide never checked makes the whole
+    version due again.
+    """
+    # PDF entries only: enrich_with_upstream stamps last_check on those and
+    # nothing else, so an html-single library simply never qualifies to skip.
+    ages = [seconds_since((manifest.get(manifest_key(version, ch["slug"], "PDF"))
+                           or {}).get("last_check"))
+            for ch in chapters
+            if manifest.get(manifest_key(version, ch["slug"], "PDF"))]
+    if not ages or any(a is None for a in ages):
+        return None
+    return max(ages)
 
 
 def fmt_bytes(n: Optional[int]) -> str:
@@ -613,12 +661,27 @@ def archive_existing(dest: Path, prev_meta: Optional[dict],
 # Discovery
 # ---------------------------------------------------------------------------
 
-def discover_latest_version() -> str:
-    final = get_final_url(BASE_URL + "/")
-    m = re.search(r"/red_hat_openshift_ai_self-managed/([^/]+)", final)
+def discover_from_landing(timeout: int = DISCOVERY_TIMEOUT) -> tuple[str, list[str]]:
+    """
+    The current release and the full version list, from one page read: the
+    landing page redirects to whatever Red Hat currently ships (the only
+    authority on "latest") and the page it lands on carries the version menu.
+
+    Only used when starting from nothing or under --rediscover — it is the
+    site's least reliable URL, so a run that can avoid it does.
+    """
+    try:
+        resp = SESSION.get(BASE_URL + "/", timeout=timeout, allow_redirects=True)
+    except requests.RequestException:
+        HEALTH.record(None)
+        raise
+    HEALTH.record(resp.status_code)
+    resp.raise_for_status()
+    m = re.search(r"/red_hat_openshift_ai_self-managed/([^/]+)", resp.url)
     if not m:
-        raise RuntimeError(f"Could not extract version from redirect URL: {final}")
-    return m.group(1)
+        raise RuntimeError(f"Could not extract version from redirect URL: {resp.url}")
+    PAGE_CACHE[resp.url] = resp.text
+    return m.group(1), picker_versions(resp.text)
 
 
 def probe_version(ver: str) -> tuple[bool, Optional[int]]:
@@ -629,6 +692,12 @@ def probe_version(ver: str) -> tuple[bool, Optional[int]]:
     """
     try:
         resp = SESSION.head(f"{BASE_URL}/{ver}", timeout=10, allow_redirects=True)
+        # 5xx only: these are speculative URLs for versions that mostly
+        # do not exist, and the site tarpits a burst of misses rather than
+        # 404ing them, so a hung probe is routine. Counting those as
+        # outages marked a healthy site degraded and aborted the run.
+        if resp.status_code >= 500:
+            HEALTH.record(resp.status_code)
         # Reject redirects that landed on a different version or the base page
         return (resp.status_code == 200 and f"/{ver}" in resp.url), resp.status_code
     except requests.RequestException:
@@ -671,10 +740,9 @@ def ahead_candidates(latest: str) -> set[str]:
 
     Deliberately short. Every miss is the slow path (0.2–1.5 s, since
     docs.redhat.com throttles bursts of 404s), and this only has to catch a
-    version that is published but is not yet the site's default — because
-    discover_latest_version() follows the site's own redirect on every run,
-    so whatever Red Hat currently ships is always picked up even if it is
-    nowhere near this window.
+    version that is published but is not yet listed in the page's own
+    version menu — which is where the list normally comes from, so this
+    runs only when that menu cannot be read.
     """
     try:
         major, minor = split_version(latest)
@@ -741,51 +809,97 @@ def probe_versions(candidates: list[str], workers: int = 20) -> set[str]:
     return found
 
 
+# A version page is 365 KB and two things want it in the same run: the
+# version menu, and that version's chapter list. Handed over once, then
+# dropped, so nothing here goes stale across a long session.
+PAGE_CACHE: dict[str, str] = {}
+
+
+def picker_versions(html: str) -> list[str]:
+    """The <select id="product_version"> options, newest first, or []."""
+    picker = BeautifulSoup(html, "html.parser").select_one("#product_version")
+    if not picker:
+        return []
+    return sort_versions(
+        v for v in (o.get("value", "").strip() for o in picker.find_all("option"))
+        if re.fullmatch(r"\d+(\.\d+)+", v))
+
+
+def versions_from_picker(seed: str) -> list[str]:
+    """
+    Every published version, from the page's own <select id="product_version">
+    — measured on 3.5, exactly what a full candidate sweep finds, in one
+    0.3 s read instead of ~10 s of probing. Older pages were once said to
+    list only a subset, hence the caller's union with what it already knew.
+
+    Returns [] rather than raising, so callers can fall back to probing.
+    """
+    url = f"{BASE_URL}/{seed}"
+    html = get_html(url, timeout=DISCOVERY_TIMEOUT)
+    PAGE_CACHE[url] = html
+    return picker_versions(html)
+
+
 def discover_all_versions(latest: str, exhaustive: bool = False) -> list[str]:
     """
     Probe all plausible version URLs in parallel.
 
-    The version switcher on the docs page only shows a subset of versions,
-    so we probe candidate URLs directly instead. This is the slow path —
-    docs.redhat.com throttles a burst of misses (a 404 costs 0.2–1.5 s versus
-    0.05 s for a hit, and raising the worker count barely helps), so a full
-    sweep runs well over ten seconds. Callers should prefer the cached list
-    plus frontier_candidates(); see resolve_versions().
+    The fallback for when the page's own version menu cannot be read. This
+    is the slow path — docs.redhat.com throttles a burst of misses (a 404
+    costs 0.2–1.5 s versus 0.05 s for a hit, some hang until they time out,
+    and raising the worker count barely helps), so a full sweep runs well
+    over ten seconds. See resolve_versions().
     """
     found = probe_versions(version_candidates(latest, exhaustive))
     found.add(latest)
     return sort_versions(found)
 
 
-def resolve_versions(manifest: dict, output_dir: Path,
-                     latest: str, force: bool = False) -> list[str]:
+def resolve_versions(manifest: dict, output_dir: Path, latest: str,
+                     force: bool = False,
+                     picked: Optional[list[str]] = None) -> list[str]:
     """
-    Return every known docs version, reusing the cached list where possible.
+    Return every known docs version, and record it in the manifest.
 
-    First run (or --rediscover) sweeps all ~55 candidates. After that the list
-    is cached in the manifest and only the frontier is probed — about five
-    requests instead of fifty-five, which is the difference between a twelve
-    second startup and under a second.
+    Normally the caller has already read the list from the page's own
+    version menu and passes it in. Probing candidate URLs is the fallback
+    for when that menu cannot be read, and --rediscover forces it — the
+    escape hatch if the menu is ever wrong or incomplete.
     """
     cache = manifest.get(VERSIONS_KEY, {})
     known = cache.get("found", [])
 
-    if force or not known:
+    if force:
+        picked = []
+    elif picked is None:
+        try:
+            picked = versions_from_picker(latest)
+        except requests.RequestException:
+            picked = []                 # fall through to probing
+
+    swept = False
+    if picked:
+        # Unioned with what was already known: an older page's menu may
+        # list less than the newest one does, and a version tracked before
+        # must not silently vanish because a menu stopped mentioning it.
+        versions = sort_versions(set(picked) | set(known) | {latest})
+        new = set(picked) - set(known) if known else set()
+    elif force or not known:
         versions = discover_all_versions(latest, exhaustive=force)
+        swept, new = True, set()
     else:
         new = probe_versions(frontier_candidates(latest, known))
-        if new:
-            console.print(f"  [green]New version(s) published:[/green] "
-                          f"[bold]{', '.join(sort_versions(new))}[/bold]")
         versions = sort_versions(set(known) | new | {latest})
+    if new:
+        console.print(f"  [green]New version(s) published:[/green] "
+                      f"[bold]{', '.join(sort_versions(new))}[/bold]")
 
+    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     manifest[VERSIONS_KEY] = {
         "found": versions,
         "latest": latest,
-        "checked_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "full_sweep_at": (time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-                          if force or not known
-                          else cache.get("full_sweep_at")),
+        "checked_at": now,
+        "full_sweep_at": now if swept else cache.get("full_sweep_at"),
     }
     save_manifest(output_dir, manifest)
     return versions
@@ -794,7 +908,7 @@ def resolve_versions(manifest: dict, output_dir: Path,
 def discover_chapters(version: str) -> list[dict]:
     """Return chapters as [{"slug", "title", "category"}, ...]."""
     url = f"{BASE_URL}/{version}"
-    html = get_html(url)
+    html = PAGE_CACHE.pop(url, None) or get_html(url)
     soup = BeautifulSoup(html, "html.parser")
 
     link_pattern = re.compile(
@@ -939,7 +1053,7 @@ def check_chapter_status(output_dir: Path, manifest: dict, version: str,
 
 def enrich_with_upstream(chapters: list[dict], statuses: dict,
                          manifest: dict, output_dir: Path,
-                         version: str, fmt: str) -> bool:
+                         version: str) -> bool:
     """
     Probe every chapter in parallel (one 8 KB ranged request each) and compare
     upstream against the manifest on two signals:
@@ -1007,7 +1121,7 @@ def worst_status(ch_statuses: list[dict]) -> str:
     return "ok"
 
 
-def version_aggregate(chapters: list[dict], statuses: dict, fmt: str) -> dict:
+def version_aggregate(chapters: list[dict], statuses: dict) -> dict:
     """Return {total, ok, changed, corrupt, missing} counts for a version."""
     counts = {"total": len(chapters), "ok": 0, "changed": 0,
               "corrupt": 0, "missing": 0}
@@ -1265,7 +1379,7 @@ def write_index(output_dir: Path, version: str, chapters: list[dict],
     """
     version_dir = output_dir / version
     now = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime())
-    counts = version_aggregate(chapters, statuses, "")
+    counts = version_aggregate(chapters, statuses)
 
     lines = [
         f"# Red Hat OpenShift AI {version} — documentation index",
@@ -1632,18 +1746,15 @@ class LiveChoice(questionary.Choice):
     """
     A choice whose *styled* fragments are rebuilt on every frame.
 
-    LiveText above can only produce plain text: questionary renders a scalar
-    title under a single style class, so a live row drawn that way is stuck
-    with whatever colour that class has. A list title is passed through to
-    prompt_toolkit untouched — and because questionary rebuilds the token
-    list on every repaint, reading the title from a property makes those
-    fragments live *and* individually coloured.
+    LiveText above can only produce plain text, since questionary renders a
+    scalar title under one style class. A list title passes through to
+    prompt_toolkit untouched and is rebuilt on every repaint, so reading it
+    from a property makes the row live *and* individually coloured.
 
-    Created disabled: the busy row is a status, not something to select, and
-    questionary skips disabled rows when moving the cursor.
+    disabled=True marks a status row; questionary skips those when moving.
     """
 
-    def __init__(self, render, value: str, disabled=True):
+    def __init__(self, render, value: str, disabled=None):
         self.render = render
         super().__init__(title=[("", "")], value=value, disabled=disabled)
 
@@ -1658,12 +1769,9 @@ class LiveChoice(questionary.Choice):
 
 def busy_fragments(stage: str) -> list:
     """
-    The status row for the first phase, finding out which versions exist.
-
-    Same spinner as everywhere else, only green: there are no version rows
-    yet and nothing else on screen moves, so in the usual grey it reads as a
-    frozen program. Once the rows appear they animate themselves and the
-    grey spinner is enough.
+    The status row while the version list is being found: the usual spinner,
+    green because nothing else is on screen yet to show the program is
+    alive. Once the rows appear they animate themselves.
     """
     return [("fg:#00ff88 bold", spinner_frame()),
             ("fg:#888888", f" {stage}")]
@@ -1715,23 +1823,41 @@ def spinner_frame() -> str:
     return SPINNER[int(time.monotonic() * 10) % len(SPINNER)]
 
 
+def skipped_note(catalog) -> str:
+    """
+    How many versions were left alone as recently compared, and when the
+    first of them is due again. Lives in the heading rather than per row:
+    the rows are already at the edge of a normal window, and the soonest
+    expiry is one number for the whole list.
+    """
+    ages = getattr(catalog, "ages", None)
+    if not ages:
+        return ""
+    window = 3600 * float((catalog.config or {}).get("recheck_after_hours") or 0)
+    due = window - min(ages.values())
+    return (f" · {len(ages)} checked within {fmt_age(window)}"
+            + (f", next due in {fmt_age(due)}" if due >= 60 else ", due now"))
+
+
 def versions_label(catalog, settled_count: Optional[int] = None) -> str:
     """Heading for the versions block, counting what is known right now."""
     if settled_count is not None:
-        return (f"  ─── Versions ({settled_count}) ───" if settled_count
-                else "  ─── Versions (none found) ───")
+        return (f"  ─── Versions ({settled_count}){skipped_note(catalog)} ───"
+                if settled_count else "  ─── Versions (none found) ───")
     if catalog is None or not catalog.versions:
         return "  ─── Versions (searching…) ───"
     found = len(catalog.versions)
     ready = sum(1 for v in catalog.versions
                 if catalog.state.get(v) == "ready")
     if ready == found:
-        return f"  ─── Versions ({found}) ───"
+        return f"  ─── Versions ({found}){skipped_note(catalog)} ───"
     return f"  ─── Versions ({found} found · {ready} ready) ───"
 
 
 def version_rows(all_versions: list[str], latest: Optional[str],
-                 version_data: dict, manifest: Optional[dict]) -> list[dict]:
+                 version_data: dict, manifest: Optional[dict],
+                 timing: Optional[dict] = None,
+                 ages: Optional[dict] = None) -> list[dict]:
     """
     The column values behind every version row.
 
@@ -1751,7 +1877,8 @@ def version_rows(all_versions: list[str], latest: Optional[str],
             # manifest, so counting it now sizes the release column once
             # instead of widening it as each version lands.
             rows.append({"v": v, "name": name, "count": "", "extra": "",
-                         "z": z, "colour": "", "date": "", "size": ""})
+                         "z": z, "colour": "", "date": "", "size": "",
+                         "secs": "", "secs_label": ""})
             continue
 
         c = data["counts"]
@@ -1791,12 +1918,25 @@ def version_rows(all_versions: list[str], latest: Optional[str],
         elif min(dates) == max(dates):
             span = min(dates)
         else:
-            span = f"{min(dates)} → {max(dates)}"
+            span = f"{min(dates)} … {max(dates)}"
 
+        # Either how long this run's check took, or — when it was skipped
+        # as recent — how old the answer on screen actually is. Saying
+        # nothing would imply freshness the row does not have.
+        took, age = (timing or {}).get(v), (ages or {}).get(v)
+        if age is not None:
+            # No "checked" prefix: the heading above the list already says
+            # what the ages are, and the rows are tight enough as it is.
+            secs, secs_label = f"{fmt_age(age)} ago", ""
+        elif took:
+            secs, secs_label = fmt_secs(took), "took "
+        else:
+            secs, secs_label = "", ""
         rows.append({"v": v, "name": name, "count": f"{ok_n}/{total}",
                      "extra": extra, "z": z, "colour": colour,
                      "date": span,
-                     "size": fmt_bytes(on_disk) if on_disk else ""})
+                     "size": fmt_bytes(on_disk) if on_disk else "",
+                     "secs": secs, "secs_label": secs_label})
     return rows
 
 
@@ -1806,7 +1946,7 @@ def row_widths(rows: list[dict]) -> dict:
     (latest)" vs "v2.25") and counts ("0/31" vs "39/39") differ in width, so
     fixed padding leaves the columns ragged.
     """
-    return {
+    w = {
         "name": max((len(r["name"]) for r in rows), default=0),
         "count": max((len(r["count"]) for r in rows), default=0),
         "body": max((len(r["count"]) + len(" downloaded") + len(r["extra"])
@@ -1815,7 +1955,21 @@ def row_widths(rows: list[dict]) -> dict:
                     if r["z"] and r["z"] != r["v"]), default=0),
         "date": max((len(r["date"]) for r in rows if r.get("date")), default=0),
         "size": max((len(r["size"]) for r in rows), default=0),
+        "secs": max((len(r["secs"]) for r in rows), default=0),
+        "wordy": max((len(r["secs_label"]) + len(r["secs"])
+                      for r in rows if r["secs"]), default=0),
     }
+    # How the timing column is spelled depends on what the window can take.
+    # A wrapped row splits in two and pushes the rest of the list down, so
+    # the words go first, then the column itself — the row proper always
+    # wins the space.
+    base = (POINTER_COLUMNS + 2 + w["name"] + 3 + w["body"]
+            + sum(3 + w[c] for c in ("rel", "date", "size") if w[c]))
+    room = shutil.get_terminal_size().columns - base
+    w["wordy_secs"] = bool(w["secs"]) and room >= 3 + w["wordy"]
+    if w["secs"] and room < 3 + w["secs"]:
+        w["secs"] = 0
+    return w
 
 
 def row_body(r: dict, w: dict) -> str:
@@ -1823,59 +1977,76 @@ def row_body(r: dict, w: dict) -> str:
     return f"{r['count']:>{w['count']}} downloaded"
 
 
-def row_tail(r: dict, w: dict) -> str:
+# questionary's own left gutter: three columns for the pointer, two for the
+# ○/● indicator. Not ours to set, but it eats into the row's width budget.
+POINTER_COLUMNS = 5
+
+
+def row_tail(r: dict, w: dict, lit: bool = True) -> list:
     """
-    Release / dates / size, each padded to a fixed width so the columns line
-    up even when a row has no release, no dates or no files at all.
+    Release / dates / size / how long the check took, padded to fixed widths
+    so the columns line up even when a row has no release or no files.
+
+    Fragments, not one string: the release is a fact about the version like
+    the count is, so it shares that green, while the timing sits a shade
+    below the dates. `lit` is off while the row's own check is still running.
     """
     rel = f"release {r['z']}" if r["z"] and r["z"] != r["v"] else ""
     pad = w["body"] - len(row_body(r, w)) - len(r["extra"]) + 3
-    out = " " * pad + f"{rel:<{w['rel']}}"
+    out = [("", " " * pad),
+           ("fg:#00ff88" if lit and rel else "", f"{rel:<{w['rel']}}")]
     if w["date"]:
-        out += f"   {r['date']:>{w['date']}}"
+        out.append(("fg:#888888", f"   {r['date']:>{w['date']}}"))
     if w["size"]:
-        out += f"   {r['size']:>{w['size']}}"
+        out.append(("fg:#888888", f"   {r['size']:>{w['size']}}"))
+    if w["secs"]:
+        # Blank, not absent, until this row's own check is in: the time so
+        # far would still grow, and the column has to hold its place.
+        wordy = w.get("wordy_secs")
+        took = (f"{r['secs_label'] if wordy else ''}{r['secs']}") if lit else ""
+        out.append(("fg:#444444",
+                    f"   {took:>{w['wordy'] if wordy else w['secs']}}"))
     return out
 
 
-def pending_row_text(version: str, catalog, all_versions: list[str],
-                     latest: Optional[str], version_data: dict,
-                     manifest: Optional[dict]) -> str:
+def pending_row_fragments(version: str, catalog, all_versions: list[str],
+                          latest: Optional[str], version_data: dict,
+                          manifest: Optional[dict]) -> list:
     """
     One version's row while the background check runs.
 
     Says what is happening to *this* version rather than showing a static
-    placeholder, so a row that is genuinely waiting its turn is
-    distinguishable from one being fetched right now.
-
-    Widths are re-measured on every frame rather than captured once: rows
-    arrive one at a time, and a width frozen before the first result would
-    leave the finished rows ragged against each other. Measuring the whole
-    set each time keeps them aligned with each other and with the final
-    coloured table.
+    placeholder, so a row waiting its turn is distinguishable from one being
+    fetched now. Widths are re-measured every frame because rows arrive one
+    at a time: a width frozen before the first result leaves them ragged.
     """
-    rows = version_rows(all_versions, latest, version_data, manifest)
+    rows = version_rows(all_versions, latest, version_data, manifest,
+                        catalog.timing, catalog.ages)
     w = row_widths(rows)
     r = next((row for row in rows if row["v"] == version), None)
     state = catalog.state.get(version, "queued")
 
-    # The two-space indent every row already carries doubles as the "busy"
-    # slot, so the spinner costs no width: a trailing "comparing…" would
-    # push the widest row ~15 columns past the settled one and wrap it on a
-    # narrow terminal, which is exactly the ragged look this avoids. Which
-    # phase it is in is on the status line above the list anyway.
+    # The indent every row already carries doubles as the "busy" slot, so
+    # the spinner costs no width; the phase itself is named on the status
+    # line above the list.
     mark = f"{spinner_frame()} " if state in ("loading", "comparing") else "  "
-    head = f"{mark}{r['name'] if r else version:<{w['name']}}   "
+    head = [("", f"{mark}{r['name'] if r else version:<{w['name']}}   ")]
 
     if state == "failed":
-        return head + "could not load"
+        return head + [("fg:#888888", "could not load")]
     if r is None or not r["count"]:
-        return head + ("reading guide list…" if state == "loading"
-                       else "waiting…")
+        return head + [("fg:#888888", "reading guide list…" if state == "loading"
+                        else "waiting…")]
 
-    # Settled columns, in the same places as the final coloured row — only
-    # the styling is missing, so nothing moves when the check lands.
-    return (head + row_body(r, w) + r["extra"] + row_tail(r, w)).rstrip()
+    # Colour lands per row, as soon as that version's own comparison is in —
+    # it does not wait for the others. Before that the counts are local-only
+    # and a complete-looking set can still turn out to have updates upstream,
+    # so an early green would have to be taken back.
+    done = state == "ready"
+    out = head + [(r["colour"] if done else "", row_body(r, w))]
+    if r["extra"]:
+        out.append(("fg:#ffcc00" if done else "", r["extra"]))
+    return out + row_tail(r, w, lit=done)
 
 
 def pointed_control(app):
@@ -2085,7 +2256,6 @@ def tui_library_screen(output_dir: Path, manifest: dict,
 
 def tui_version_screen(all_versions: list[str], latest: Optional[str],
                        version_data: dict,   # version -> {chapters, statuses, counts}
-                       version_filter: Optional[str],
                        manifest: Optional[dict] = None,
                        library: str = "",
                        catalog=None) -> Optional[str]:
@@ -2098,23 +2268,21 @@ def tui_version_screen(all_versions: list[str], latest: Optional[str],
     # Build every row first, then size the columns from the real strings —
     # the same helpers the live rows use, so the table does not re-flow when
     # the background check finishes.
-    rows = version_rows(all_versions, latest, version_data, manifest)
+    rows = version_rows(all_versions, latest, version_data, manifest,
+                        getattr(catalog, "timing", None),
+                        getattr(catalog, "ages", None))
     w = row_widths(rows)
 
     choices = []
     for r in rows:
         if pending:
-            # Scalar title, not styled segments: questionary passes a list
-            # title straight through to prompt_toolkit (which needs real
-            # strings), but formats a scalar on every frame. So a LiveText
-            # here rewrites this one row in place as its state advances —
-            # no prompt teardown, no flicker. Colour returns on the final
-            # repaint once everything is settled.
-            choices.append(questionary.Choice(
-                title=LiveText(lambda v=r["v"]:
-                               pending_row_text(v, catalog, all_versions,
-                                                latest, version_data,
-                                                manifest)),
+            # Rebuilt on every frame, so each row advances in place — no
+            # prompt teardown, no flicker — and keeps its own colour the
+            # moment its own check lands, rather than the whole table
+            # turning green at the end.
+            choices.append(LiveChoice(
+                lambda v=r["v"]: pending_row_fragments(
+                    v, catalog, all_versions, latest, version_data, manifest),
                 value=r["v"]))
             continue
 
@@ -2127,7 +2295,7 @@ def tui_version_screen(all_versions: list[str], latest: Optional[str],
         parts.append((r["colour"], row_body(r, w)))
         if r["extra"]:
             parts.append(("fg:#ffcc00", r["extra"]))
-        parts.append(("fg:#888888", row_tail(r, w)))
+        parts += row_tail(r, w)
         choices.append(questionary.Choice(title=parts, value=r["v"]))
 
     # Library entry on top: it answers "what do I already have?" without any
@@ -2185,7 +2353,7 @@ def tui_version_screen(all_versions: list[str], latest: Optional[str],
 
 
 def tui_chapter_screen(version: str, chapters: list[dict],
-                       statuses: dict, fmt: str) -> list[dict]:
+                       statuses: dict) -> list[dict]:
     """
     Show chapter checkbox list. Returns list of selected chapter dicts.
     Chapters with status missing/changed are pre-checked.
@@ -2367,6 +2535,12 @@ class Catalog:
         # show each one as it lands instead of all of them at the very end
         self.updated = threading.Event()
         self.warnings: list[str] = []
+        # Seconds of upstream work per version: reading its guide list, plus
+        # comparing the files held against upstream. Wall clock, so the
+        # parallel phase charges each version only its own request time.
+        self.timing: dict[str, float] = {}
+        # Versions whose comparison was skipped as recent: seconds since
+        self.ages: dict[str, float] = {}
 
     def mark_updated(self) -> None:
         self.updated.set()
@@ -2380,15 +2554,75 @@ class Catalog:
         self._run()
         return self
 
+    def _find_versions(self) -> list[str]:
+        """
+        The published version list: from a page the site answers quickly
+        for if it can, from the manifest if it cannot.
+
+        Every version page carries the version menu and answers in 0.1–0.3 s.
+        The landing page carries it too *and* names the current release, but
+        is the site's least reliable URL — so it is read only when starting
+        from nothing, where its redirect is the only way to learn "latest".
+        """
+        cache = self.manifest.get(VERSIONS_KEY) or {}
+        cached = sort_versions(cache.get("found") or [])
+
+        if cached and not self.args.rediscover:
+            try:
+                picked = versions_from_picker(cached[0])
+            except requests.RequestException:
+                picked = []
+            if picked:
+                # Highest published version, rather than whatever the
+                # landing page redirects to. The two agree unless a version
+                # is published before being promoted — a far smaller price
+                # than that page's variance.
+                found = resolve_versions(self.manifest, self.output_dir,
+                                         sort_versions(set(picked) | set(cached))[0],
+                                         picked=picked)
+                self.latest = found[0]
+                return found
+
+        try:
+            self.latest, picked = discover_from_landing(
+                DISCOVERY_TIMEOUT if cached else DISCOVERY_TIMEOUT_FIRST_RUN)
+            return resolve_versions(self.manifest, self.output_dir, self.latest,
+                                    force=self.args.rediscover,
+                                    picked=picked or None)
+        except requests.RequestException:
+            if not cached:
+                raise           # nothing to fall back on: a genuine dead end
+
+        newest = cached[0]
+        self.latest = newest
+
+        # One cheap page to tell the two cases apart, because probe failures
+        # are swallowed as "no such version": if even a version we know
+        # exists will not answer, the site is down and probing the frontier
+        # would only say "nothing new" for the wrong reason.
+        alive, code = probe_version(newest)
+        if not alive and version_probe_blocked(code):
+            self.warnings.append(
+                f"Could not reach docs.redhat.com — showing the version list "
+                f"from {(cache.get('checked_at') or 'the last run')[:10]}. "
+                f"New releases will not appear until it answers again.")
+            return cached
+
+        found = resolve_versions(self.manifest, self.output_dir,
+                                 self.latest, force=self.args.rediscover)
+        self.latest = found[0]
+        self.warnings.append(
+            f"docs.redhat.com did not answer for the current-release page; "
+            f"treating v{self.latest} as the newest, from the version pages "
+            f"themselves.")
+        return found
+
     def _run(self) -> None:
         try:
             if self.only:
                 self.versions = [self.only]
             else:
-                self.latest = discover_latest_version()
-                found = resolve_versions(self.manifest, self.output_dir,
-                                         self.latest,
-                                         force=self.args.rediscover)
+                found = self._find_versions()
                 wanted = [str(v) for v in (self.config.get("versions") or [])]
                 self.versions = ([v for v in found if v in wanted] if wanted
                                  else found)
@@ -2431,15 +2665,33 @@ class Catalog:
                     if self.data.get(v)
                     and self.data[v]["counts"]["ok"]
                     + self.data[v]["counts"]["corrupt"] > 0]
+            # Comparing is ~100 requests and can run to minutes; one that
+            # happened within the window is not worth repeating just to
+            # draw the menu. Opening the version still re-checks, since
+            # these are deliberately not added to self.checked.
+            window = 3600 * float(self.config.get("recheck_after_hours")
+                                  or 0)
+            fresh = {}
+            if window:
+                for v in list(held):
+                    age = last_compared(self.manifest, v,
+                                        self.data[v]["chapters"])
+                    if age is not None and age < window:
+                        fresh[v] = age
+                        self.state[v] = "ready"
+                        held.remove(v)
+                self.ages.update(fresh)
+                self.mark_updated()
             for i, v in enumerate(held, 1):
                 self.stage = f"Checking downloaded versions ({i}/{len(held)})…"
                 self.state[v] = "comparing"
                 self.mark_updated()
                 d = self.data[v]
+                started = time.monotonic()
                 enrich_with_upstream(d["chapters"], d["statuses"], self.manifest,
-                                     self.output_dir, v, self.fmt)
-                d["counts"] = version_aggregate(d["chapters"], d["statuses"],
-                                                self.fmt)
+                                     self.output_dir, v)
+                d["counts"] = version_aggregate(d["chapters"], d["statuses"])
+                self.timing[v] = self.timing.get(v, 0) + time.monotonic() - started
                 self.checked.add(v)
                 self.state[v] = "ready"
                 self.mark_updated()      # this version's row is now accurate
@@ -2457,13 +2709,15 @@ class Catalog:
     def _load_version(self, v: str):
         self.state[v] = "loading"
         self.mark_updated()
+        started = time.monotonic()
         try:
             chapters = discover_chapters(v)
             statuses = {ch["slug"]: check_chapter_status(
                 self.output_dir, self.manifest, v, ch["slug"], self.fmt,
                 verify=self.args.verify) for ch in chapters}
+            self.timing[v] = self.timing.get(v, 0) + time.monotonic() - started
             return v, {"chapters": chapters, "statuses": statuses,
-                       "counts": version_aggregate(chapters, statuses, self.fmt)}
+                       "counts": version_aggregate(chapters, statuses)}
         except Exception as e:
             # Collected rather than printed: the UI thread owns the terminal
             self.warnings.append(f"Could not load version {v}: {e}")
@@ -2567,16 +2821,23 @@ def main():
             catalog.run_sync()
         catalog.flush_warnings()
         if catalog.error:
-            console.print(f"[red]ERROR:[/red] Could not reach docs.redhat.com: "
-                          f"{catalog.error}")
+            # A site-side failure is named as one; anything else keeps the
+            # original text, since then the cause really might be local.
+            if HEALTH.suspected:
+                HEALTH.warn()
+            else:
+                console.print(f"[red]ERROR:[/red] Could not reach "
+                              f"docs.redhat.com: {catalog.error}")
             RUN.note("upstream unreachable")
             sys.exit(1)
 
     if not version_filter and not interactive:
         latest = catalog.latest
         versions_to_show = catalog.versions
-        console.print(f"  Latest: [bold green]{latest}[/bold green]  │  "
-                      f"Found: [bold]{', '.join(versions_to_show)}[/bold]")
+        console.print("  Latest: "
+                      + (f"[bold green]{latest}[/bold green]" if latest
+                         else "[dim]unknown (upstream unreachable)[/dim]")
+                      + f"  │  Found: [bold]{', '.join(versions_to_show)}[/bold]")
 
     version_data = catalog.data
 
@@ -2592,9 +2853,9 @@ def main():
             if v not in catalog.checked:     # held versions already compared
                 with console.status(f"Checking v{v} against upstream…"):
                     enrich_with_upstream(data["chapters"], data["statuses"],
-                                         manifest, output_dir, v, fmt)
+                                         manifest, output_dir, v)
                     data["counts"] = version_aggregate(data["chapters"],
-                                                       data["statuses"], fmt)
+                                                       data["statuses"])
             c = data["counts"]
             console.print(f"\n[bold]v{v}[/bold]  "
                           f"[green]{c['ok']}/{c['total']} downloaded[/green]"
@@ -2627,7 +2888,7 @@ def main():
             # Without this probe --all only ever sees local state, so an
             # upstream change could never be picked up non-interactively.
             with console.status(f"Checking v{v} against upstream…"):
-                enrich_with_upstream(chapters, statuses, manifest, output_dir, v, fmt)
+                enrich_with_upstream(chapters, statuses, manifest, output_dir, v)
             if HEALTH.degraded:
                 HEALTH.warn()
                 sys.exit(1)
@@ -2668,8 +2929,11 @@ def main():
             if catalog.error and not reported_error:
                 reported_error = True
                 RUN.note("upstream unreachable")
-                console.print(f"\n[red]Could not reach docs.redhat.com:[/red] "
-                              f"{catalog.error}")
+                if HEALTH.suspected:
+                    HEALTH.warn()
+                else:
+                    console.print(f"\n[red]Could not reach docs.redhat.com:[/red] "
+                                  f"{catalog.error}")
                 console.print("[dim]Your downloaded files are still browsable "
                               "in the local library.[/dim]")
             lib = scan_library(output_dir, manifest)
@@ -2685,7 +2949,7 @@ def main():
             # by now simply appears, without interrupting what you were doing.
             versions_to_show = catalog.versions
             chosen_version = tui_version_screen(
-                versions_to_show, catalog.latest, version_data, version_filter,
+                versions_to_show, catalog.latest, version_data,
                 manifest, summary, catalog
             )
 
@@ -2724,8 +2988,8 @@ def main():
         if chosen_version not in checked:
             with console.status(f"Checking v{chosen_version} against upstream…"):
                 enrich_with_upstream(chapters, statuses, manifest, output_dir,
-                                     chosen_version, fmt)
-                data["counts"] = version_aggregate(chapters, statuses, fmt)
+                                     chosen_version)
+                data["counts"] = version_aggregate(chapters, statuses)
             checked.add(chosen_version)
 
         # Don't walk the user into a chapter picker whose downloads are all
@@ -2751,7 +3015,7 @@ def main():
                       + (f"  [red]{c['corrupt']} damaged[/red]"
                          if c["corrupt"] else ""))
 
-        action, selected_chapters = tui_chapter_screen(chosen_version, chapters, statuses, fmt)
+        action, selected_chapters = tui_chapter_screen(chosen_version, chapters, statuses)
 
         if action == "quit":
             print_farewell(output_dir, manifest)
@@ -2784,7 +3048,7 @@ def main():
                     if old and old.get("doc_date"):
                         s["doc_date"] = old["doc_date"]
             version_data[chosen_version]["statuses"] = new_statuses
-            version_data[chosen_version]["counts"] = version_aggregate(chapters, new_statuses, fmt)
+            version_data[chosen_version]["counts"] = version_aggregate(chapters, new_statuses)
             refresh_structure(output_dir, chosen_version, chapters,
                               new_statuses, manifest, events)
 

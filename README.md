@@ -62,3 +62,12 @@ Nothing is ever overwritten in place. A superseded guide moves to
 `<version>/archive/` tagged with the publication date it carried, and when the
 z-stream itself advances the whole directory is frozen as a hardlinked snapshot
 (`3.5.1/`), which costs no extra disk for unchanged guides.
+
+## Tests
+
+```bash
+python3 -m unittest test_rhoai_docs        # add -v to list them
+```
+
+Standard library only, no network: every test that would reach
+docs.redhat.com stubs the request, so the suite is deterministic and runs in under a second.

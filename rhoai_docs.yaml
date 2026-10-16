@@ -9,6 +9,14 @@ output_dir: ~/rhoai-docs
 # Options: pdf | html-single | both
 format: pdf
 
+# How long a version's upstream comparison stays good for. Comparing one
+# version costs a request per guide — around a hundred for a full library,
+# minutes when docs.redhat.com is slow — so the menu's background check
+# leaves alone anything compared this recently and says "checked 2h ago"
+# instead of a duration. Opening a version always re-checks it first.
+# Set to 0 to compare on every run.
+recheck_after_hours: 1
+
 # Versions to show in the interactive menu. Leave empty to show all discovered
 # versions. Only filters the menu — the Local library always lists everything
 # on disk, and --version reaches any version regardless of this list.
